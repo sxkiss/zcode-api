@@ -6,7 +6,7 @@ import { loadConfig } from "./config/loader.js";
 import { AuthManager } from "./auth/manager.js";
 import { startServer, type ProxyServer } from "./server/server.js";
 import { startControlListener, LogBuffer, type ControlState } from "./android/control.js";
-import { loadCredential, saveCredential, clearCredential, getStorePath } from "./auth/store.js";
+import { loadCredential, loadCredentials, saveCredential, removeCredential, clearCredential, getStorePath } from "./auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient, LOGIN_TIMEOUT_MS, parsePastedCallbackUrl, type OAuthResult } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
 import type { Credential } from "./auth/types.js";
@@ -145,8 +145,12 @@ Usage:
   zcode-proxy auth login <provider> Login via OAuth (provider: zai | bigmodel)
   zcode-proxy auth login <provider> --import
                                     Import API key from ~/.zcode/v2/config.json
-  zcode-proxy auth logout           Clear stored credentials
-  zcode-proxy auth status           Show current authentication state
+  zcode-proxy auth add --jwt <jwt>  Import an existing credential directly
+        [--userId <uid>]            (no OAuth; start-plan jwt or --apiKey coding)
+        [--apiKey <key>] [--secret <sec>] [--provider zai|bigmodel]
+  zcode-proxy auth logout           Clear ALL stored credentials
+  zcode-proxy auth logout <key|uid> Remove ONE credential (apiKey prefix / userId)
+  zcode-proxy auth status            Show credential pool (all accounts)
   zcode-proxy claim [list|now]      List / claim weekend-plan trial packages
   zcode-proxy version               Show version
   zcode-proxy help                  Show this help
@@ -172,14 +176,14 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
   const config = loadConfig(path);
 
   const auth = new AuthManager();
-  const cred = await loadCredential();
-  if (!cred) {
+  const creds = await loadCredentials();
+  if (creds.length === 0) {
     console.error("Not logged in. Run: zcode-proxy auth login " + config.provider);
     process.exit(1);
   }
-  auth.setOAuthCredential(cred);
+  auth.setCredentials(creds);
 
-  if (debug) printDebugBanner(config, path, cred);
+  if (debug) printDebugBanner(config, path, creds);
 
   const server = await startServer(buildServerOptions(config, auth, debug));
   const url = `http://${server.hostname}:${server.port}`;
@@ -339,9 +343,9 @@ async function runAndroid(): Promise<void> {
   });
 }
 
-function printDebugBanner(config: ProxyConfig, path: string, cred: Credential | null): void {
-  const credShape = cred
-    ? `${cred.apiKey.slice(0, 6)}...${cred.apiKey.slice(-4)} (${cred.apiKey.length} chars)`
+function printDebugBanner(config: ProxyConfig, path: string, creds: Credential[] | null): void {
+  const credShape = creds && creds.length > 0
+    ? `${creds.length} credential(s) [${creds[0].apiKey.slice(0, 6)}...${creds[0].apiKey.slice(-4)} (${creds[0].apiKey.length} chars)]`
     : "(none)";
   const active = config.providers[config.provider];
   console.log("=== zcode-proxy DEBUG MODE ===");
@@ -365,8 +369,10 @@ function authCommand(args: string[]): void {
 
   if (sub === "login") {
     authLogin(args.slice(1));
+  } else if (sub === "add") {
+    authAdd(args.slice(1));
   } else if (sub === "logout") {
-    authLogout();
+    authLogout(args.slice(1));
   } else if (sub === "status") {
     authStatus();
   } else {
@@ -434,9 +440,11 @@ async function authLogin(args: string[]): Promise<void> {
   }
 
   await saveCredential(cred);
+  const all = await loadCredentials();
   console.log(`\nLogged in as ${provider}.`);
   console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
   if (cred.userId) console.log(`  User ID: ${cred.userId}`);
+  console.log(`  Pool:    ${all.length} credential(s) stored`);
   console.log(`  Stored:  ${getStorePath()}`);
 }
 
@@ -490,24 +498,76 @@ export function ensureDeviceMidInConfig(path: string): string {
   return mid;
 }
 
-function authLogout(): void {
+/**
+ * Import an existing credential into the pool without going through OAuth —
+ * used to restore accounts whose API key / JWT was captured elsewhere (e.g. a
+ * registration run) but whose password or access_token is no longer available
+ * to re-login. Supports both coding-plan (apiKey[+secret]) and start-plan (jwt).
+ */
+async function authAdd(args: string[]): Promise<void> {
+  const get = (flag: string): string | undefined => {
+    const i = args.indexOf(flag);
+    return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+  };
+  const apiKey = get("--apiKey");
+  const secret = get("--secret");
+  const jwt = get("--jwt");
+  const userId = get("--userId");
+  const provider = (get("--provider") as ProviderId | undefined) ?? "zai";
+  if (!apiKey && !jwt) {
+    console.error("Usage: zcode-proxy auth add --apiKey <key> [--secret <sec>] [--userId <uid>]");
+    console.error("       zcode-proxy auth add --jwt <jwt>   [--userId <uid>] [--provider zai|bigmodel]");
+    process.exit(1);
+  }
+  const cred: Credential = { apiKey: apiKey ?? "", provider };
+  if (secret) cred.secret = secret;
+  if (jwt) cred.jwt = jwt;
+  if (userId) cred.userId = userId;
+  await saveCredential(cred);
+  const all = await loadCredentials();
+  console.log(`Added credential (pool now ${all.length}).`);
+  if (apiKey) console.log(`  API Key: ${apiKey.substring(0, 12)}...`);
+  if (userId) console.log(`  User ID: ${userId}`);
+  if (jwt) console.log(`  JWT:     ${jwt.slice(0, 20)}... (start-plan)`);
+  console.log(`  Stored:  ${getStorePath()}`);
+}
+
+async function authLogout(args: string[]): Promise<void> {
+  const query = args[0];
+  if (query) {
+    // Remove a single credential by apiKey prefix or userId.
+    const removed = await removeCredential(query);
+    const pool = await loadCredentials();
+    if (!removed) {
+      console.log(`No credential matched "${query}". Pool unchanged (${pool.length} credential(s)).`);
+      return;
+    }
+    console.log(`Removed matching credential. Pool now ${pool.length} credential(s).`);
+    return;
+  }
   if (!existsSync(getStorePath())) {
     console.log("Not logged in.");
     return;
   }
   clearCredential();
-  console.log("Logged out. Credentials removed.");
+  console.log("Logged out. All credentials removed.");
 }
 
 async function authStatus(): Promise<void> {
-  const cred = await loadCredential();
-  if (!cred) {
+  const all = await loadCredentials();
+  if (all.length === 0) {
     console.log("Not logged in.");
     console.log("Run: zcode-proxy auth login <zai|bigmodel>");
     return;
   }
-  console.log(`Logged in: ${cred.provider}`);
-  console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
+  console.log(`Logged in: ${all.length} credential(s)`);
+  all.forEach((cred, i) => {
+    console.log(`  [${i + 1}] ${cred.provider}`);
+    console.log(`        API Key: ${cred.apiKey.substring(0, 12)}...`);
+    if (cred.secret) console.log(`        Secret:  present (${cred.secret.length} chars)`);
+    if (cred.userId) console.log(`        User ID: ${cred.userId}`);
+    if (cred.jwt) console.log(`        JWT:     present`);
+  });
   console.log(`  Store:   ${getStorePath()}`);
 }
 

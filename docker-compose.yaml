@@ -1,0 +1,43 @@
+# zcode-proxy 容器启动（docker compose 版）
+#
+# 替代原来的裸 docker run：
+#   docker run -d --name zcode-proxy --network host --restart unless-stopped \
+#     -v /home/sxkiss/zcode-data/config/config.yaml:/data/config.yaml \
+#     -v /home/sxkiss/zcode-data/credentials:/home/bun/.zcode-proxy \
+#     -e ZCODE_PROXY_PORT=8090 -e ZCODE_PROXY_CONFIG=/data/config.yaml \
+#     zcode-proxy:latest
+#
+# 用法：
+#   docker compose up -d --build        # 构建镜像并启动
+#   docker compose logs -f              # 看日志
+#   docker compose down && docker compose up -d --build   # 重建
+#
+# 在容器里添加/查看多凭证（挂载目录即凭证存储，见下方 volumes）：
+#   # 交互式 OAuth 登录（累加第 2、3… 个账号）：
+#   docker exec -it zcode-proxy bun run src/index.ts auth login zai
+#   # 查看凭证池：
+#   docker exec zcode-proxy bun run src/index.ts auth status
+#   # 删除某个账号（按 apiKey 前缀或 userId）：
+#   docker exec zcode-proxy bun run src/index.ts auth logout <apiKey前缀|userId>
+# 注意：容器内凭证用容器自身的加密 key 派生（ZCODE_PROXY_CREDENTIAL_SECRET
+# 缺省时 = homedir-platform-arch），与本机直接跑的加密 key 不同，切勿混用同一
+# 份 credentials.json；真正想固定密钥就设 ZCODE_PROXY_CREDENTIAL_SECRET。
+
+services:
+  zcode-proxy:
+    image: zcode-proxy:latest
+    build: .
+    container_name: zcode-proxy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      ZCODE_PROXY_PORT: "8090"
+      ZCODE_PROXY_CONFIG: /data/config.yaml
+      # 可选：固定 credential store 的加密密钥（省略则由容器机器派生）。
+      # 容器重建后 homedir 不变，机器派生 key 本就稳定；设了则升级为可移植。
+      # ZCODE_PROXY_CREDENTIAL_SECRET: ""
+    volumes:
+      # 生产配置（含 proxyApiKey / models / claim 等）
+      - /home/sxkiss/zcode-data/config/config.yaml:/data/config.yaml
+      # 凭证存储目录（容器内 ~/.zcode-proxy/credentials.json = 多凭证池，JSON 数组加密）
+      - /home/sxkiss/zcode-data/credentials:/home/bun/.zcode-proxy

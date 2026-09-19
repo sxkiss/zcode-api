@@ -7,6 +7,7 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import type { Credential } from "./types.js";
+import { credentialKey } from "./types.js";
 
 const STORE_DIR = join(homedir(), ".zcode-proxy");
 const STORE_FILE = join(STORE_DIR, "credentials.json");
@@ -101,18 +102,67 @@ async function encrypt(plaintext: string): Promise<string> {
   return encryptWith(getEncryptionKey(), plaintext);
 }
 
-export async function saveCredential(cred: Credential): Promise<void> {
+/**
+ * Identity key for de-duplication: the upstream API key is globally unique per
+ * account, so it is the stable primary key. A re-login for the same account
+ * (same apiKey) refreshes secret/jwt/expiresAt/userId in place instead of
+ * pushing a duplicate.
+ */
+function credKey(c: Credential): string {
+  return credentialKey(c);
+}
+
+/**
+ * Normalize a decrypted store payload into a credential list.
+ *
+ * The on-disk plaintext is JSON. Two historical shapes are accepted:
+ *   - current:  { credentials: Credential[] }
+ *   - legacy:   a single `Credential` object (pre-multi-cred store)
+ * Any object lacking a `credentials` array is wrapped as a singleton list so
+ * old stores transparently migrate on first write.
+ */
+function normalizeList(parsed: unknown): Credential[] {
+  if (Array.isArray(parsed)) return parsed as Credential[];
+  if (parsed && typeof parsed === "object" && Array.isArray((parsed as any).credentials)) {
+    return (parsed as any).credentials as Credential[];
+  }
+  if (parsed && typeof parsed === "object" && (parsed as any).apiKey) {
+    return [parsed as Credential];
+  }
+  return [];
+}
+
+async function writeCredentials(list: Credential[]): Promise<void> {
   mkdirSync(dirname(STORE_FILE), { recursive: true });
-  const json = JSON.stringify(cred);
+  const json = JSON.stringify({ credentials: list });
   const encrypted = await encrypt(json);
   atomicWriteStore(JSON.stringify({ encrypted }));
 }
 
-export async function loadCredential(): Promise<Credential | null> {
-  if (!existsSync(STORE_FILE)) return null;
+export async function saveCredential(cred: Credential): Promise<void> {
+  const list = await loadCredentials();
+  const key = credKey(cred);
+  const idx = list.findIndex((c) => credKey(c) === key);
+  if (idx >= 0) list[idx] = cred;
+  else list.push(cred);
+  await writeCredentials(list);
+}
+
+/** Append/replace a credential without touching the others (alias of saveCredential). */
+export async function addCredential(cred: Credential): Promise<void> {
+  return saveCredential(cred);
+}
+
+/** Replace the entire credential list (used by the serve path to prime the pool). */
+export async function saveAllCredentials(list: Credential[]): Promise<void> {
+  await writeCredentials(list);
+}
+
+export async function loadCredentials(): Promise<Credential[]> {
+  if (!existsSync(STORE_FILE)) return [];
   const raw = readFileSync(STORE_FILE, "utf-8");
   const parsed = JSON.parse(raw);
-  if (!parsed.encrypted) return null;
+  if (!parsed.encrypted) return [];
 
   let json: string;
   try {
@@ -127,24 +177,41 @@ export async function loadCredential(): Promise<Credential | null> {
       // ({homedir}-{platform}-{arch}), so cross-machine copies or OS reinstalls
       // produce undecryptable ciphertext. Silently treat as "not logged in".
       console.warn(`Ignoring corrupted or stale credentials at ${STORE_FILE}: ${(e as Error).message}`);
-      return null;
+      return [];
     }
     // Re-store under the new KDF. Best-effort by design: the credential is
     // already decrypted in memory, so a failed re-write (read-only dir, AV
     // lock on Windows, ...) must NOT fail this load — it retries next boot.
     try {
-      atomicWriteStore(JSON.stringify({ encrypted: await encrypt(json) }));
+      await writeCredentials(normalizeList(JSON.parse(json)));
     } catch (e) {
       console.warn(`Credential re-encryption under the new key derivation failed (will retry on next load): ${(e as Error).message}`);
     }
   }
 
   try {
-    return JSON.parse(json) as Credential;
+    return normalizeList(JSON.parse(json));
   } catch (e) {
     console.warn(`Ignoring corrupted credentials at ${STORE_FILE}: ${(e as Error).message}`);
-    return null;
+    return [];
   }
+}
+
+export async function loadCredential(): Promise<Credential | null> {
+  const list = await loadCredentials();
+  return list[0] ?? null;
+}
+
+export async function removeCredential(query: string): Promise<boolean> {
+  const list = await loadCredentials();
+  const before = list.length;
+  const filtered = list.filter((c) => {
+    const k = credKey(c);
+    return !(k === query || k.startsWith(query) || (c.userId && c.userId === query));
+  });
+  if (filtered.length === before) return false;
+  await writeCredentials(filtered);
+  return true;
 }
 
 export function clearCredential(): void {

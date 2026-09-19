@@ -39,3 +39,13 @@ export function isExpired(cred: Credential, now: number = Date.now()): boolean {
   if (cred.expiresAt === undefined) return false;
   return now >= cred.expiresAt;
 }
+
+/**
+ * Stable identity key for a credential — used for pool de-duplication and the
+ * 401 failover blacklist. Prefers the permanent API key (coding-plan); falls
+ * back to userId then jwt so start-plan credentials (no apiKey) still dedupe
+ * and fail over independently.
+ */
+export function credentialKey(cred: Credential): string {
+  return cred.apiKey || cred.userId || cred.jwt || "";
+}

@@ -290,6 +290,34 @@ export async function proxyRequest(
     return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
   }
 
+  // coding-plan 401: the upstream rejected this account's API key. With a
+  // multi-credential pool, mark it failed (drops it from rotation for the
+  // cooldown) and retry ONCE on the next healthy account. Single-credential
+  // pools are left untouched so behavior is identical to before.
+  if (upstreamResp.status === 401 && !startPlan) {
+    const pool = auth.summary ? auth.summary() : null;
+    if (pool && pool.total > 1 && typeof auth.markFailed === "function") {
+      auth.markFailed(cred);
+      let nextCred: typeof cred | null = null;
+      try { nextCred = await auth.getCredential(); } catch { /* pool exhausted */ }
+      if (nextCred && nextCred.apiKey !== cred.apiKey) {
+        if (debug) debugLine(reqId, `auth_failover: ${cred.apiKey.slice(0, 8)}… → ${nextCred.apiKey.slice(0, 8)}… (401)`);
+        console.log(`${reqId} credential 401, failing over to next account`);
+        cred = nextCred;
+        upstreamHeaderPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, config.identity, config.plan, captchaHeaders, clientSession);
+        upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, captchaHeaders, clientSession);
+        try {
+          upstreamResp = await dispatch(upstreamReq, upstreamHeaderPairs);
+        } catch (err) {
+          if (debug) debugError(reqId, "upstream_unreachable", (err as Error).message);
+          printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
+          return errorResponse(502, "upstream_unreachable", (err as Error).message);
+        }
+        if (debug) debugLine(reqId, `← failover ${upstreamResp.status} ${upstreamResp.statusText}`);
+      }
+    }
+  }
+
   // start-plan: on explicit captcha challenge, retry once with a fresh
   // pooled token (the challenged token was already consumed by this request;
   // getCaptchaToken takes the next pre-solved one). Detection covers the
